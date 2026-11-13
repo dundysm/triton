@@ -6630,23 +6630,37 @@ def test_inline_asm_packed_multiple_outputs(device):
 # -----------------------
 
 
+# The mapped functions live at module scope because the interpreter does not
+# resolve names captured from an enclosing test function yet (#12581).
+@triton.jit
+def _map_elementwise_compare(x, y):
+    if x < y:
+        return -1
+    elif x == y:
+        return 0
+    else:
+        return 1
+
+
+@triton.jit
+def _map_elementwise_divmod(a, b):
+    return a // b, a % b
+
+
+@triton.jit
+def _map_elementwise_divmod_pack(a0, a1, b0, b1):
+    return a0 // b0, a1 // b1, a0 % b0, a1 % b1
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_map_elementwise(num_ctas, device):
-
-    @triton.jit
-    def compare(x, y):
-        if x < y:
-            return -1
-        elif x == y:
-            return 0
-        else:
-            return 1
 
     @triton.jit
     def kernel(X, Y, Z, BLOCK: tl.constexpr):
         x = tl.load(X + tl.arange(0, BLOCK))
         y = tl.load(Y + tl.arange(0, BLOCK))
-        z = tl.map_elementwise(compare, x, y)
+        z = tl.map_elementwise(_map_elementwise_compare, x, y)
         tl.store(Z + tl.arange(0, BLOCK), z)
 
     shape = (128, )
@@ -6661,18 +6675,15 @@ def test_map_elementwise(num_ctas, device):
     np.testing.assert_equal(z_ref, to_numpy(z_tri))
 
 
+@pytest.mark.interpreter
 def test_map_elementwise_multiple_outputs(device):
-
-    @triton.jit
-    def divmod(a, b):
-        return a // b, a % b
 
     @triton.jit
     def kernel(A, B, C, D, BLOCK: tl.constexpr):
         a = tl.load(A + tl.arange(0, BLOCK))
         b = tl.load(B + tl.arange(0, BLOCK))
 
-        c, d = tl.map_elementwise(divmod, a, b)
+        c, d = tl.map_elementwise(_map_elementwise_divmod, a, b)
 
         tl.store(C + tl.arange(0, BLOCK), c)
         tl.store(D + tl.arange(0, BLOCK), d)
@@ -6694,18 +6705,15 @@ def test_map_elementwise_multiple_outputs(device):
     np.testing.assert_equal(D_ref, to_numpy(D_tri))
 
 
+@pytest.mark.interpreter
 def test_map_elementwise_pack(device):
-
-    @triton.jit
-    def divmod(a0, a1, b0, b1):
-        return a0 // b0, a1 // b1, a0 % b0, a1 % b1
 
     @triton.jit
     def kernel(A, B, C, D, BLOCK: tl.constexpr):
         a = tl.load(A + tl.arange(0, BLOCK))
         b = tl.load(B + tl.arange(0, BLOCK))
 
-        c, d = tl.map_elementwise(divmod, a, b, pack=2)
+        c, d = tl.map_elementwise(_map_elementwise_divmod_pack, a, b, pack=2)
 
         tl.store(C + tl.arange(0, BLOCK), c)
         tl.store(D + tl.arange(0, BLOCK), d)

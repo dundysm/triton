@@ -1277,6 +1277,53 @@ def _patch_reduce_scan(scope: _LangPatchScope):
     scope.set_attr(tl.core, "associative_scan", _new_scan)
 
 
+def _new_map_elementwise(scalar_fn, *args, pack=1, **kwargs):
+    # The compiled path builds a region for scalar_fn and lowers it per element. The
+    # interpreter has no regions, so call scalar_fn on each group of `pack` elements.
+    pack = tl.core._unwrap_if_constexpr(pack)
+    assert pack >= 1, f"pack must be >= 1, got {pack}"
+    assert len(args) > 0, "map_elementwise must have at least 1 input tensor"
+    inputs = interpreter_semantic.broadcast_tensors(*args)
+    shape = inputs[0].handle.data.shape
+    flat_inputs = [np.broadcast_to(arg.handle.data, shape).reshape(-1) for arg in inputs]
+    numel = flat_inputs[0].size
+    assert numel % pack == 0, f"number of elements ({numel}) must be divisible by pack ({pack})"
+
+    def to_scalar(value, dtype):
+        return tl.core.tensor(TensorHandle(np.array([value], dtype=_get_np_dtype(dtype)), dtype), dtype)
+
+    num_results = None
+    result_dtypes = None
+    result_data = None
+    for start in range(0, numel, pack):
+        scalar_args = []
+        for arg, flat in zip(inputs, flat_inputs):
+            for offset in range(pack):
+                scalar_args.append(to_scalar(flat[start + offset], arg.dtype))
+        ret = scalar_fn(*scalar_args)
+        ret = ret if isinstance(ret, tuple) else (ret, )
+        # Results can come back as Python constants, e.g. `return 0` in one branch
+        ret = [interpreter_semantic.to_tensor(tl.core._unwrap_if_constexpr(r), False) for r in ret]
+        if num_results is None:
+            assert len(ret) % pack == 0, "map_elementwise function must return a multiple of pack values"
+            num_results = len(ret) // pack
+            result_dtypes = [ret[i * pack].dtype for i in range(num_results)]
+            result_data = [np.empty(numel, dtype=_get_np_dtype(dtype)) for dtype in result_dtypes]
+        assert len(ret) == num_results * pack, "map_elementwise function returned a varying number of values"
+        for i, dtype in enumerate(result_dtypes):
+            for offset in range(pack):
+                value = ret[i * pack + offset]
+                if value.dtype != dtype:
+                    value = interpreter_semantic.cast(value, dtype)
+                result_data[i][start + offset] = value.handle.data.item()
+
+    results = []
+    for data, dtype in zip(result_data, result_dtypes):
+        ret_type = inputs[0].type.with_element_ty(dtype) if inputs[0].type.is_block() else dtype
+        results.append(tl.core.tensor(TensorHandle(data.reshape(shape), dtype), ret_type))
+    return results[0] if len(results) == 1 else tuple(results)
+
+
 def _patch_lang_core(lang, scope: _LangPatchScope):
 
     def _new_to_ir(self, builder):
@@ -1356,6 +1403,7 @@ def _patch_lang_core(lang, scope: _LangPatchScope):
     scope.set_attr(lang, "multiple_of", partial(_set_attr, name="tt.divisibility"))
     scope.set_attr(lang, "max_contiguous", partial(_set_attr, name="tt.contiguity"))
     scope.set_attr(lang, "max_constancy", partial(_set_attr, name="tt.constancy"))
+    scope.set_attr(lang, "map_elementwise", _new_map_elementwise)
 
     _patch_reduce_scan(scope)
 
